@@ -90,7 +90,7 @@ export const useMenuItems = () => {
     {
       icon: BugIcon,
       label: "报告问题",
-      href: "https://github.com/zhangxd1989/vivox/issues/new",  // [二开] 改为自有仓库地址
+      href: "https://github.com/zhangxd1989/vivox/issues/new?template=bug-report.yml",  // [二开] 改为自有仓库地址
     },
     {
       icon: PowerIcon,
