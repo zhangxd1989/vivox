@@ -3,6 +3,7 @@ import {
   DEFAULT_SYSTEM_PROMPT,
   SPEECH_TO_TEXT_PROVIDERS,
   STORAGE_KEYS,
+  STREAMING_STT_PROVIDERS,
 } from "@/config";
 import { getPlatform, safeLocalStorage, trackAppStart } from "@/lib";
 import { getShortcutsConfig } from "@/lib/storage";
@@ -561,7 +562,7 @@ export const AppProvider = ({ children }: { children: ReactNode }) => {
     provider: string;
     variables: Record<string, string>;
   }) => {
-    if (provider && !allSttProviders.some((p) => p.id === provider)) {
+    if (provider && !allSttProviders.some((p) => p.id === provider) && !STREAMING_STT_PROVIDERS.some((p) => p.id === provider)) {
       console.warn(`Invalid STT provider ID: ${provider}`);
       return;
     }

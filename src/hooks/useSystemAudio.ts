@@ -3,7 +3,7 @@ import { useWindowResize, useGlobalShortcuts } from ".";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { useApp } from "@/contexts";
-import { fetchSTT, fetchAIResponse } from "@/lib/functions";
+import { fetchAIResponse } from "@/lib/functions";
 import {
   DEFAULT_QUICK_ACTIONS,
   DEFAULT_SYSTEM_PROMPT,
@@ -85,6 +85,21 @@ export function useSystemAudio() {
   const [isContinuousMode, setIsContinuousMode] = useState<boolean>(false);
   const [isRecordingInContinuousMode, setIsRecordingInContinuousMode] =
     useState<boolean>(false);
+  const [partialTranscription, setPartialTranscription] = useState<string>("");
+  const [isWsConnected, setIsWsConnected] = useState<boolean>(false);
+
+  // Sentence-level results with speaker diarization and per-sentence AI responses
+  const [sentenceResults, setSentenceResults] = useState<Array<{
+    sentenceId: number;
+    speakerId: number | null;
+    text: string;
+    aiResponse: string;
+    isAiProcessing: boolean;
+  }>>([]);
+
+  // Segment-level comprehensive analysis
+  const [segmentSummary, setSegmentSummary] = useState<string>("");
+  const [isSegmentSummarizing, setIsSegmentSummarizing] = useState<boolean>(false);
 
   const [conversation, setConversation] = useState<ChatConversation>({
     id: "",
@@ -100,7 +115,6 @@ export function useSystemAudio() {
 
   const {
     selectedSttProvider,
-    allSttProviders,
     selectedAIProvider,
     allAiProviders,
     systemPrompt,
@@ -216,107 +230,192 @@ export function useSystemAudio() {
     };
   }, []);
 
-  // Handle single speech detection event (both VAD and continuous modes)
+  // Handle streaming transcription events from Rust backend
   useEffect(() => {
-    let speechUnlisten: (() => void) | undefined;
+    let unlisteners: (() => void)[] = [];
 
-    const setupEventListener = async () => {
+    const setupEventListeners = async () => {
       try {
-        speechUnlisten = await listen("speech-detected", async (event) => {
-          try {
+        // Partial (intermediate) transcription results
+        const unlistenPartial = await listen<{text: string; sentence_id: number}>(
+          "transcription-partial",
+          (event) => {
+            console.log("[STT-FE] transcription-partial:", event.payload);
             if (!capturing) return;
-
-            const base64Audio = event.payload as string;
-            // Convert to blob
-            const binaryString = atob(base64Audio);
-            const bytes = new Uint8Array(binaryString.length);
-            for (let i = 0; i < binaryString.length; i++) {
-              bytes[i] = binaryString.charCodeAt(i);
-            }
-            const audioBlob = new Blob([bytes], { type: "audio/wav" });
-
-            const usePluelyAPI = await shouldUsePluelyAPI();
-            if (!selectedSttProvider.provider && !usePluelyAPI) {
-              setError("未选择语音提供商。");
-              return;
-            }
-
-            const providerConfig = allSttProviders.find(
-              (p) => p.id === selectedSttProvider.provider
-            );
-
-            if (!providerConfig && !usePluelyAPI) {
-              setError("未找到语音提供商配置。");
-              return;
-            }
-
-            setIsProcessing(true);
-
-            // Add timeout wrapper for STT request (30 seconds)
-            const sttPromise = fetchSTT({
-              provider: providerConfig,
-              selectedProvider: selectedSttProvider,
-              audio: audioBlob,
-            });
-
-            const timeoutPromise = new Promise<string>((_, reject) => {
-              setTimeout(
-                () => reject(new Error("语音转录超时（30秒）")),
-                30000
-              );
-            });
-
-            try {
-              const transcription = await Promise.race([
-                sttPromise,
-                timeoutPromise,
-              ]);
-
-              if (transcription.trim()) {
-                setLastTranscription(transcription);
-                setError("");
-
-                const effectiveSystemPrompt = useSystemPrompt
-                  ? systemPrompt || DEFAULT_SYSTEM_PROMPT
-                  : contextContent || DEFAULT_SYSTEM_PROMPT;
-
-                const previousMessages = conversation.messages.map((msg) => {
-                  return { role: msg.role, content: msg.content };
-                });
-
-                await processWithAI(
-                  transcription,
-                  effectiveSystemPrompt,
-                  previousMessages
-                );
-              } else {
-                setError("收到空转录");
-              }
-            } catch (sttError: any) {
-              console.error("语音转文字错误:", sttError);
-              setError(sttError.message || "音频转录失败");
-              setIsPopoverOpen(true);
-            }
-          } catch (err) {
-            setError("处理语音失败");
-          } finally {
-            setIsProcessing(false);
+            setPartialTranscription(event.payload.text);
+            setIsPopoverOpen(true);
           }
+        );
+        unlisteners.push(unlistenPartial);
+
+        // Final transcription results (sentence complete)
+        const unlistenFinal = await listen<{
+          text: string; sentence_id: number; speaker_id: number | null;
+          begin_time: number | null; end_time: number | null;
+        }>(
+          "transcription-final",
+          async (event) => {
+            console.log("[STT-FE] transcription-final:", event.payload);
+            if (!capturing) return;
+            const { text, sentence_id, speaker_id } = event.payload;
+            setPartialTranscription("");
+            setIsProcessing(false);
+
+            if (text.trim()) {
+              setError("");
+              const newSentence = {
+                sentenceId: sentence_id,
+                speakerId: speaker_id ?? null,
+                text,
+                aiResponse: "",
+                isAiProcessing: true,
+              };
+              setSentenceResults(prev => [...prev, newSentence]);
+
+              // Keep lastTranscription in sync for backward compatibility
+              setLastTranscription(text);
+
+              // Process with AI using existing system prompt
+              const effectiveSystemPrompt = useSystemPrompt
+                ? systemPrompt || DEFAULT_SYSTEM_PROMPT
+                : contextContent || DEFAULT_SYSTEM_PROMPT;
+
+              const previousMessages = conversation.messages.map((msg) => {
+                return { role: msg.role, content: msg.content };
+              });
+
+              try {
+                let aiText = "";
+                for await (const chunk of fetchAIResponse({
+                  provider: allAiProviders.find(p => p.id === selectedAIProvider.provider),
+                  selectedProvider: selectedAIProvider,
+                  systemPrompt: effectiveSystemPrompt,
+                  history: previousMessages,
+                  userMessage: text,
+                  imagesBase64: [],
+                })) {
+                  aiText += chunk;
+                  // Update the sentence's AI response incrementally
+                  const currentText = aiText;
+                  setSentenceResults(prev =>
+                    prev.map(s =>
+                      s.sentenceId === sentence_id
+                        ? { ...s, aiResponse: currentText }
+                        : s
+                    )
+                  );
+                }
+                // Mark processing complete for this sentence
+                setSentenceResults(prev =>
+                  prev.map(s =>
+                    s.sentenceId === sentence_id
+                      ? { ...s, isAiProcessing: false }
+                      : s
+                  )
+                );
+                setLastAIResponse(aiText);
+              } catch (aiError: any) {
+                console.error("AI processing error:", aiError);
+                setSentenceResults(prev =>
+                  prev.map(s =>
+                    s.sentenceId === sentence_id
+                      ? { ...s, aiResponse: `AI 处理失败: ${aiError.message}`, isAiProcessing: false }
+                      : s
+                  )
+                );
+              }
+            } else {
+              // Empty transcription - silently ignore (common for short noise/silence segments)
+              console.log("[STT-FE] Ignoring empty transcription for sentence", sentence_id);
+            }
+          }
+        );
+        unlisteners.push(unlistenFinal);
+
+        // WebSocket connection events
+        const unlistenWsConnecting = await listen("ws-connecting", () => {
+          setIsWsConnected(false);
         });
+        unlisteners.push(unlistenWsConnecting);
+
+        const unlistenWsConnected = await listen("ws-connected", () => {
+          setIsWsConnected(true);
+        });
+        unlisteners.push(unlistenWsConnected);
+
+        // WebSocket error events
+        const unlistenWsError = await listen<string>("ws-error", (event) => {
+          setError(event.payload);
+          setIsWsConnected(false);
+          setIsProcessing(false);
+        });
+        unlisteners.push(unlistenWsError);
+
+        // Speech segment complete
+        const unlistenSegmentComplete = await listen("speech-segment-complete", async () => {
+          setIsWsConnected(false);
+
+          // Trigger segment-level comprehensive analysis
+          setSentenceResults(currentSentences => {
+            if (currentSentences.length === 0) return currentSentences;
+
+            // Format all sentences with speaker labels
+            const formattedText = currentSentences
+              .map(s => {
+                const speaker = s.speakerId != null ? `说话人${s.speakerId + 1}` : "说话人";
+                return `[${speaker}] ${s.text}`;
+              })
+              .join("\n");
+
+            // Get current system prompt
+            const effectivePrompt = useSystemPrompt
+              ? systemPrompt || DEFAULT_SYSTEM_PROMPT
+              : contextContent || DEFAULT_SYSTEM_PROMPT;
+
+            const summaryPrompt = `${effectivePrompt}\n\n请对以下对话记录做综合分析，包括要点摘要、关键信息和后续建议：\n\n${formattedText}`;
+
+            // Start segment summary processing
+            setIsSegmentSummarizing(true);
+            setSegmentSummary("");
+
+            (async () => {
+              try {
+                let summaryText = "";
+                for await (const chunk of fetchAIResponse({
+                  provider: allAiProviders.find(p => p.id === selectedAIProvider.provider),
+                  selectedProvider: selectedAIProvider,
+                  systemPrompt: summaryPrompt,
+                  history: [],
+                  userMessage: formattedText,
+                  imagesBase64: [],
+                })) {
+                  summaryText += chunk;
+                  setSegmentSummary(summaryText);
+                }
+              } catch (err: any) {
+                setSegmentSummary(`综合分析失败: ${err.message || "未知错误"}`);
+              } finally {
+                setIsSegmentSummarizing(false);
+              }
+            })();
+
+            return currentSentences; // Don't modify sentences
+          });
+        });
+        unlisteners.push(unlistenSegmentComplete);
+
       } catch (err) {
-        setError("设置语音监听器失败");
+        setError("设置转录监听器失败");
       }
     };
 
-    setupEventListener();
+    setupEventListeners();
 
     return () => {
-      if (speechUnlisten) speechUnlisten();
+      unlisteners.forEach((fn) => fn());
     };
   }, [
     capturing,
-    selectedSttProvider,
-    allSttProviders,
     conversation.messages.length,
   ]);
 
@@ -438,16 +537,30 @@ export function useSystemAudio() {
           ? selectedAudioDevices.output.id
           : null;
 
+      // Get STT provider config
+      const providerId = selectedSttProvider.provider || "dashscope";
+      let providerVariables: Record<string, string> = {};
+      try {
+        providerVariables = await invoke<Record<string, string>>(
+          "get_stt_provider_config",
+          { providerId }
+        );
+      } catch {
+        providerVariables = selectedSttProvider.variables || {};
+      }
+
       // Start a new continuous recording session
       await invoke<string>("start_system_audio_capture", {
         vadConfig: vadConfig,
         deviceId: deviceId,
+        providerId: providerId,
+        providerVariables: providerVariables,
       });
     } catch (err) {
       console.error("开始连续录音失败:", err);
       setError(`开始录音失败: ${err}`);
     }
-  }, [vadConfig, selectedAudioDevices.output.id]);
+  }, [vadConfig, selectedAudioDevices.output.id, selectedSttProvider]);
 
   // Ignore current recording (stop without transcription)
   const ignoreContinuousRecording = useCallback(async () => {
@@ -585,25 +698,41 @@ export function useSystemAudio() {
       }
 
       // VAD mode: Start recording immediately
-      // Stop any existing capture
+      // Stop any existing capture and wait for cleanup
       await invoke<string>("stop_system_audio_capture");
+      await new Promise(resolve => setTimeout(resolve, 100));
 
       const deviceId =
         selectedAudioDevices.output.id !== "default"
           ? selectedAudioDevices.output.id
           : null;
 
-      // Start capture with VAD config
+      // Get STT provider config from storage
+      const providerId = selectedSttProvider.provider || "dashscope";
+      let providerVariables: Record<string, string> = {};
+      try {
+        providerVariables = await invoke<Record<string, string>>(
+          "get_stt_provider_config",
+          { providerId }
+        );
+      } catch {
+        // No saved config, use selectedSttProvider.variables
+        providerVariables = selectedSttProvider.variables || {};
+      }
+
+      // Start capture with VAD config and STT provider info
       await invoke<string>("start_system_audio_capture", {
         vadConfig: vadConfig,
         deviceId: deviceId,
+        providerId: providerId,
+        providerVariables: providerVariables,
       });
     } catch (err) {
       const errorMessage = err instanceof Error ? err.message : String(err);
       setError(errorMessage);
       setIsPopoverOpen(true);
     }
-  }, [vadConfig, selectedAudioDevices.output.id]);
+  }, [vadConfig, selectedAudioDevices.output.id, selectedSttProvider]);
 
   const stopCapture = useCallback(async () => {
     try {
@@ -779,6 +908,10 @@ export function useSystemAudio() {
     setIsAIProcessing(false);
     setIsPopoverOpen(false);
     setUseSystemPrompt(true);
+    setSentenceResults([]);
+    setSegmentSummary("");
+    setIsSegmentSummarizing(false);
+    setPartialTranscription("");
   }, []);
 
   // Update VAD configuration
@@ -884,6 +1017,13 @@ export function useSystemAudio() {
     isAIProcessing,
     lastTranscription,
     lastAIResponse,
+    partialTranscription,
+    isWsConnected,
+    // Sentence-level results with speaker diarization
+    sentenceResults,
+    // Segment-level comprehensive analysis
+    segmentSummary,
+    isSegmentSummarizing,
     error,
     setupRequired,
     startCapture,

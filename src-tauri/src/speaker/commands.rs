@@ -1,18 +1,17 @@
-// Vivox AI Speech Detection, and capture system audio (speaker output) as a stream of f32 samples.
+// Vivox AI Speech Detection with real-time streaming STT
+use crate::speaker::resampler::AudioResampler;
+use crate::speaker::streaming_stt;
 use crate::speaker::{AudioDevice, SpeakerInput};
 use anyhow::Result;
-use base64::{engine::general_purpose::STANDARD as B64, Engine as _};
 use futures_util::StreamExt;
-use hound::{WavSpec, WavWriter};
 use serde::{Deserialize, Serialize};
-use std::collections::VecDeque;
-use std::io::Cursor;
+use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 use tauri::{AppHandle, Emitter, Listener, Manager};
 use tauri_plugin_shell::ShellExt;
-use tracing::{error, warn};
+use tracing::{error, info, warn};
 
 // VAD Configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -33,15 +32,25 @@ impl Default for VadConfig {
         Self {
             enabled: true,
             hop_size: 1024,
-            sensitivity_rms: 0.012, // Much less sensitive - only real speech
-            peak_threshold: 0.035,  // Higher threshold - filters clicks/noise
-            silence_chunks: 45,     // ~1.0s of silence before stopping
-            min_speech_chunks: 7,   // ~0.16s - captures short answers
-            pre_speech_chunks: 12,  // ~0.27s - enough to catch word start
-            noise_gate_threshold: 0.003, // Stronger noise filtering
-            max_recording_duration_secs: 180, // 3 minutes default
+            sensitivity_rms: 0.012,
+            peak_threshold: 0.035,
+            silence_chunks: 45,
+            min_speech_chunks: 7,
+            pre_speech_chunks: 12,
+            noise_gate_threshold: 0.003,
+            max_recording_duration_secs: 180,
         }
     }
+}
+
+/// Transcription event payload sent to frontend
+#[derive(Debug, Clone, Serialize)]
+struct TranscriptionPayload {
+    text: String,
+    sentence_id: i32,
+    speaker_id: Option<i32>,
+    begin_time: Option<i64>,
+    end_time: Option<i64>,
 }
 
 #[tauri::command]
@@ -49,20 +58,25 @@ pub async fn start_system_audio_capture(
     app: AppHandle,
     vad_config: Option<VadConfig>,
     device_id: Option<String>,
+    provider_id: Option<String>,
+    provider_variables: Option<HashMap<String, String>>,
 ) -> Result<(), String> {
+    eprintln!("[STT] start_system_audio_capture called: provider={:?}, device={:?}", provider_id, device_id);
+
     let state = app.state::<crate::AudioState>();
 
-    // Check if already capturing (atomic check)
-    {
-        let guard = state
-            .stream_task
+    // Check if already capturing (use is_capturing as authoritative flag)
+    let already_capturing = {
+        let is_cap = *state
+            .is_capturing
             .lock()
             .map_err(|e| format!("Failed to acquire lock: {}", e))?;
-
-        if guard.is_some() {
-            warn!("Capture already running");
-            return Err("Capture already running".to_string());
-        }
+        is_cap
+    };
+    if already_capturing {
+        eprintln!("[STT] Capture already running, stopping first...");
+        let _ = stop_system_audio_capture(app.clone()).await;
+        tokio::time::sleep(tokio::time::Duration::from_millis(300)).await;
     }
 
     // Update VAD config if provided
@@ -82,13 +96,11 @@ pub async fn start_system_audio_capture(
     let stream = input.stream();
     let sr = stream.sample_rate();
 
-    // Validate sample rate
+    eprintln!("[STT] Speaker input created, sample_rate={}", sr);
+
     if !(8000..=96000).contains(&sr) {
         error!("Invalid sample rate: {}", sr);
-        return Err(format!(
-            "Invalid sample rate: {}. Expected 8000-96000 Hz",
-            sr
-        ));
+        return Err(format!("Invalid sample rate: {}. Expected 8000-96000 Hz", sr));
     }
 
     let app_clone = app.clone();
@@ -98,29 +110,47 @@ pub async fn start_system_audio_capture(
         .map_err(|e| format!("Failed to read VAD config: {}", e))?
         .clone();
 
-    // Mark as capturing BEFORE spawning task
+    // Default to "dashscope" if no provider specified
+    let stt_provider_id = provider_id.unwrap_or_else(|| "dashscope".to_string());
+    let stt_variables = provider_variables.unwrap_or_default();
+
     *state
         .is_capturing
         .lock()
         .map_err(|e| format!("Failed to set capturing state: {}", e))? = true;
 
-    // Emit capture started event
     let _ = app_clone.emit("capture-started", sr);
+
+    eprintln!("[STT] Starting VAD capture: provider={}, enabled={}", stt_provider_id, vad_config.enabled);
 
     let state_clone = app.state::<crate::AudioState>();
     let task = tokio::spawn(async move {
         if vad_config.enabled {
-            run_vad_capture(app_clone.clone(), stream, sr, vad_config).await;
+            run_vad_capture(
+                app_clone.clone(),
+                stream,
+                sr,
+                vad_config,
+                stt_provider_id,
+                stt_variables,
+            )
+            .await;
         } else {
-            run_continuous_capture(app_clone.clone(), stream, sr, vad_config).await;
+            run_continuous_capture(
+                app_clone.clone(),
+                stream,
+                sr,
+                vad_config,
+                stt_provider_id,
+                stt_variables,
+            )
+            .await;
         }
 
         let state = app_clone.state::<crate::AudioState>();
-        {
-            if let Ok(mut guard) = state.stream_task.lock() {
-                *guard = None;
-            };
-        }
+        if let Ok(mut guard) = state.stream_task.lock() {
+            *guard = None;
+        };
     });
 
     *state_clone
@@ -131,27 +161,50 @@ pub async fn start_system_audio_capture(
     Ok(())
 }
 
-// VAD-enabled capture - OPTIMIZED for real-time speech detection
+// --- Real-time VAD capture with streaming STT ---
 async fn run_vad_capture(
     app: AppHandle,
     stream: impl StreamExt<Item = f32> + Unpin,
     sr: u32,
     config: VadConfig,
+    provider_id: String,
+    provider_variables: HashMap<String, String>,
 ) {
     let mut stream = stream;
     let mut buffer: VecDeque<f32> = VecDeque::new();
-    let mut pre_speech: VecDeque<f32> =
-        VecDeque::with_capacity(config.pre_speech_chunks * config.hop_size);
-    let mut speech_buffer = Vec::new();
-    let mut in_speech = false;
-    let mut silence_chunks = 0;
-    let mut speech_chunks = 0;
-    let max_samples = sr as usize * 30; // 30s safety cap per utterance
+
+    // Pre-connect WebSocket and create resampler immediately
+    eprintln!("[STT] Pre-connecting WebSocket...");
+    let mut stt_session: Option<streaming_stt::SttSession> = None;
+    let mut resampler: Option<AudioResampler> = None;
+    let mut provider: Option<Box<dyn streaming_stt::StreamingSttProvider>> = None;
+
+    match init_streaming_stt(&app, &provider_id, &provider_variables, sr).await {
+        Ok((session, resamp, prov)) => {
+            stt_session = Some(session);
+            resampler = Some(resamp);
+            provider = Some(prov);
+            eprintln!("[STT] WebSocket pre-connected successfully");
+        }
+        Err(e) => {
+            eprintln!("[STT] Failed to pre-connect WebSocket: {}", e);
+            let _ = app.emit("ws-error", format!("连接失败: {}", e));
+            return;
+        }
+    }
+
+    let mut sample_count: u64 = 0;
+    eprintln!("[STT] VAD capture loop started, sr={}, hop_size={}", sr, config.hop_size);
 
     while let Some(sample) = stream.next().await {
         buffer.push_back(sample);
+        sample_count += 1;
 
-        // Process in fixed chunks for VAD analysis
+        // Log every 5 seconds of audio
+        if sample_count % (sr as u64 * 5) == 0 {
+            eprintln!("[STT] Audio flowing: {} samples received", sample_count);
+        }
+
         while buffer.len() >= config.hop_size {
             let mut mono = Vec::with_capacity(config.hop_size);
             for _ in 0..config.hop_size {
@@ -160,135 +213,217 @@ async fn run_vad_capture(
                 }
             }
 
-            // Apply noise gate BEFORE VAD (critical for accuracy)
+            // Apply noise gate
             let mono = apply_noise_gate(&mono, config.noise_gate_threshold);
 
-            let (rms, peak) = calculate_audio_metrics(&mono);
-            let is_speech = rms > config.sensitivity_rms || peak > config.peak_threshold;
-
-            if is_speech {
-                if !in_speech {
-                    // Speech START detected
-                    in_speech = true;
-                    speech_chunks = 0;
-
-                    // Include pre-speech buffer for natural sound
-                    speech_buffer.extend(pre_speech.drain(..));
-
-                    let _ = app.emit("speech-start", ());
-                }
-
-                speech_chunks += 1;
-                speech_buffer.extend_from_slice(&mono);
-                silence_chunks = 0; // Reset silence counter on any speech
-
-                // Safety cap: force emit if exceeds 30s
-                if speech_buffer.len() > max_samples {
-                    let normalized_buffer = normalize_audio_level(&speech_buffer, 0.1);
-                    if let Ok(b64) = samples_to_wav_b64(sr, &normalized_buffer) {
-                        // let duration = speech_buffer.len() as f32 / sr as f32;
-                        let _ = app.emit("speech-detected", b64);
-                    }
-                    speech_buffer.clear();
-                    in_speech = false;
-                    speech_chunks = 0;
-                }
-            } else {
-                // Silence detected
-                if in_speech {
-                    silence_chunks += 1;
-
-                    // Continue collecting during silence (important for natural speech)
-                    speech_buffer.extend_from_slice(&mono);
-
-                    // Check if silence duration exceeds threshold
-                    if silence_chunks >= config.silence_chunks {
-                        // Verify minimum speech duration
-                        if speech_chunks >= config.min_speech_chunks && !speech_buffer.is_empty() {
-                            // Trim trailing silence (keep ~0.15s for natural ending)
-                            let silence_duration_samples = silence_chunks * config.hop_size;
-                            let keep_silence_samples = (sr as usize) * 15 / 100; // 0.15s
-                            let trim_amount =
-                                silence_duration_samples.saturating_sub(keep_silence_samples);
-
-                            if speech_buffer.len() > trim_amount {
-                                speech_buffer.truncate(speech_buffer.len() - trim_amount);
+            // Send ALL audio to DashScope (it handles segmentation)
+            if let (Some(ref mut session), Some(ref mut resamp), Some(ref prov)) =
+                (&mut stt_session, &mut resampler, &provider)
+            {
+                let pcm = resamp.process(&mono);
+                if !pcm.is_empty() {
+                    if let Err(e) = prov.send_audio(session, &pcm).await {
+                        eprintln!("[STT] Send failed: {}, attempting reconnect...", e);
+                        // Try to reconnect
+                        stt_session = None;
+                        match init_streaming_stt(&app, &provider_id, &provider_variables, sr).await {
+                            Ok((new_session, _, _)) => {
+                                stt_session = Some(new_session);
+                                eprintln!("[STT] Reconnected successfully");
                             }
-
-                            // Emit complete speech segment
-                            let normalized_buffer = normalize_audio_level(&speech_buffer, 0.1);
-                            if let Ok(b64) = samples_to_wav_b64(sr, &normalized_buffer) {
-                                // let duration = speech_buffer.len() as f32 / sr as f32;
-                                let _ = app.emit("speech-detected", b64);
-                            } else {
-                                error!("Failed to encode speech to WAV");
-                                let _ = app.emit("audio-encoding-error", "Failed to encode speech");
+                            Err(re) => {
+                                eprintln!("[STT] Reconnect failed: {}", re);
+                                let _ = app.emit("ws-error", format!("重连失败: {}", re));
                             }
-                        } else {
-                            let _ = app.emit(
-                                "speech-discarded",
-                                "Audio too short (likely background noise)",
-                            );
                         }
-
-                        // Reset for next speech detection
-                        speech_buffer.clear();
-                        in_speech = false;
-                        silence_chunks = 0;
-                        speech_chunks = 0;
                     }
+                }
+
+                // Drain any available transcription events (non-blocking)
+                if let Some(ref mut session) = stt_session {
+                    drain_transcription_events(&app, session).await;
+                }
+            } else if stt_session.is_none() && provider.is_some() {
+                // Session is None but provider exists - try to reconnect
+                let pcm = if let Some(ref mut resamp) = resampler {
+                    resamp.process(&mono)
                 } else {
-                    // Not in speech yet - maintain rolling pre-speech buffer
-                    pre_speech.extend(mono.into_iter());
-
-                    // Trim excess (maintain fixed size)
-                    while pre_speech.len() > config.pre_speech_chunks * config.hop_size {
-                        pre_speech.pop_front();
+                    Vec::new()
+                };
+                // Attempt reconnect
+                match init_streaming_stt(&app, &provider_id, &provider_variables, sr).await {
+                    Ok((new_session, new_resamp, _)) => {
+                        stt_session = Some(new_session);
+                        resampler = Some(new_resamp);
+                        eprintln!("[STT] Reconnected after session loss");
                     }
-
-                    // Periodically shrink capacity to prevent memory bloat
-                    if pre_speech.len() == config.pre_speech_chunks * config.hop_size {
-                        pre_speech.shrink_to_fit();
-                    }
+                    Err(_) => {} // Silently retry next iteration
                 }
             }
         }
     }
+
+    // Clean up when stream ends
+    eprintln!("[STT] Audio stream ended, finishing STT...");
+    finish_streaming_stt(&app, &mut stt_session, &mut resampler, &provider).await;
 }
 
-// Continuous capture (VAD disabled)
+/// Initialize streaming STT: get provider, create resampler, connect
+async fn init_streaming_stt(
+    app: &AppHandle,
+    provider_id: &str,
+    variables: &HashMap<String, String>,
+    source_sample_rate: u32,
+) -> Result<(
+    streaming_stt::SttSession,
+    AudioResampler,
+    Box<dyn streaming_stt::StreamingSttProvider>,
+)> {
+    let _ = app.emit("ws-connecting", ());
+
+    let prov = streaming_stt::get_provider(provider_id)
+        .ok_or_else(|| anyhow::anyhow!("Unknown STT provider: {}", provider_id))?;
+
+    let resamp = AudioResampler::new(source_sample_rate, 16000)?;
+
+    let session = prov.connect(variables, 16000).await?;
+
+    let _ = app.emit("ws-connected", ());
+    info!("Streaming STT initialized: provider={}", provider_id);
+
+    Ok((session, resamp, prov))
+}
+
+/// Finish streaming STT: flush resampler, send finish, drain remaining events
+async fn finish_streaming_stt(
+    app: &AppHandle,
+    session: &mut Option<streaming_stt::SttSession>,
+    resampler: &mut Option<AudioResampler>,
+    provider: &Option<Box<dyn streaming_stt::StreamingSttProvider>>,
+) {
+    if let (Some(ref mut sess), Some(ref mut resamp), Some(ref prov)) =
+        (session.as_mut(), resampler.as_mut(), provider.as_ref())
+    {
+        // Flush remaining audio
+        let pcm = resamp.flush();
+        if !pcm.is_empty() {
+            let _ = prov.send_audio(sess, &pcm).await;
+        }
+
+        // Send finish-task
+        if let Err(e) = prov.finish(sess).await {
+            error!("Failed to finish STT task: {}", e);
+        }
+
+        // Drain remaining transcription events with timeout
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        loop {
+            tokio::select! {
+                event = sess.result_rx.recv() => {
+                    match event {
+                        Some(evt) => {
+                            if evt.sentence_id >= 0 {
+                                let event_name = if evt.is_final {
+                                    "transcription-final"
+                                } else {
+                                    "transcription-partial"
+                                };
+                                let _ = app.emit(event_name, TranscriptionPayload {
+                                    text: evt.text,
+                                    sentence_id: evt.sentence_id,
+                                    speaker_id: evt.speaker_id,
+                                    begin_time: evt.begin_time,
+                                    end_time: evt.end_time,
+                                });
+                            }
+                            if evt.is_final && evt.sentence_id >= 0 {
+                                // Got final result, we're done
+                                break;
+                            }
+                        }
+                        None => break, // Channel closed
+                    }
+                }
+                _ = tokio::time::sleep_until(deadline) => {
+                    warn!("Timeout waiting for final transcription");
+                    let _ = app.emit("ws-error", "等待转录结果超时");
+                    break;
+                }
+            }
+        }
+    }
+
+    let _ = app.emit("speech-segment-complete", ());
+    *session = None;
+    *resampler = None;
+}
+
+/// Non-blocking drain of transcription events from session
+async fn drain_transcription_events(app: &AppHandle, session: &mut streaming_stt::SttSession) {
+    while let Ok(event) = session.result_rx.try_recv() {
+        if event.sentence_id >= 0 {
+            let event_name = if event.is_final {
+                "transcription-final"
+            } else {
+                "transcription-partial"
+            };
+            let _ = app.emit(
+                event_name,
+                TranscriptionPayload {
+                    text: event.text,
+                    sentence_id: event.sentence_id,
+                    speaker_id: event.speaker_id,
+                    begin_time: event.begin_time,
+                    end_time: event.end_time,
+                },
+            );
+        }
+    }
+}
+
+// --- Continuous capture with streaming STT ---
 async fn run_continuous_capture(
     app: AppHandle,
     stream: impl StreamExt<Item = f32> + Unpin,
     sr: u32,
     config: VadConfig,
+    provider_id: String,
+    provider_variables: HashMap<String, String>,
 ) {
     let mut stream = stream;
     let max_samples = (sr as u64 * config.max_recording_duration_secs) as usize;
-
-    // Pre-allocate buffer to prevent reallocations
-    let mut audio_buffer = Vec::with_capacity(max_samples);
-    let start_time = Instant::now();
+    let start_time = std::time::Instant::now();
     let max_duration = Duration::from_secs(config.max_recording_duration_secs);
 
-    // Atomic flag for manual stop
     let stop_flag = Arc::new(AtomicBool::new(false));
     let stop_flag_for_listener = stop_flag.clone();
 
-    // Listen for manual stop event
     let stop_listener = app.listen("manual-stop-continuous", move |_| {
         stop_flag_for_listener.store(true, Ordering::Release);
     });
 
-    // Emit recording started
-    let _ = app.emit(
-        "continuous-recording-start",
-        config.max_recording_duration_secs,
-    );
+    let _ = app.emit("continuous-recording-start", config.max_recording_duration_secs);
 
-    // Accumulate audio - check stop flag on EVERY sample for immediate response
+    // Initialize streaming STT immediately
+    let mut stt_session: Option<streaming_stt::SttSession> = None;
+    let mut resampler: Option<AudioResampler> = None;
+    let mut provider: Option<Box<dyn streaming_stt::StreamingSttProvider>> = None;
+
+    match init_streaming_stt(&app, &provider_id, &provider_variables, sr).await {
+        Ok((session, resamp, prov)) => {
+            stt_session = Some(session);
+            resampler = Some(resamp);
+            provider = Some(prov);
+        }
+        Err(e) => {
+            error!("Failed to init streaming STT for continuous mode: {}", e);
+            let _ = app.emit("ws-error", e.to_string());
+        }
+    }
+
+    let mut sample_count = 0usize;
+
     loop {
-        // Check stop flag FIRST on every iteration for immediate stopping
         if stop_flag.load(Ordering::Acquire) {
             break;
         }
@@ -301,68 +436,53 @@ async fn run_continuous_capture(
                             break;
                         }
 
-                        audio_buffer.push(sample);
+                        // Send to resampler + STT
+                        if let (Some(ref mut session), Some(ref mut resamp), Some(ref prov)) =
+                            (&mut stt_session, &mut resampler, &provider)
+                        {
+                            let pcm = resamp.process(&[sample]);
+                            if !pcm.is_empty() {
+                                let _ = prov.send_audio(session, &pcm).await;
+                            }
+                            drain_transcription_events(&app, session).await;
+                        }
 
-                        let elapsed = start_time.elapsed();
+                        sample_count += 1;
 
                         // Emit progress every second
-                        if audio_buffer.len() % (sr as usize) == 0 {
+                        if sample_count % (sr as usize) == 0 {
+                            let elapsed = start_time.elapsed();
                             let _ = app.emit("recording-progress", elapsed.as_secs());
                         }
 
-                        // Check size limit (safety)
-                        if audio_buffer.len() >= max_samples {
+                        if sample_count >= max_samples || start_time.elapsed() >= max_duration {
                             break;
                         }
-
-                        // Check time limit
-                        if elapsed >= max_duration {
-                            break;
-                        }
-                    },
+                    }
                     None => {
                         warn!("Audio stream ended unexpectedly");
                         break;
                     }
                 }
             }
-            _ = tokio::time::sleep(tokio::time::Duration::from_millis(10)) => {
-            }
+            _ = tokio::time::sleep(tokio::time::Duration::from_millis(10)) => {}
         }
     }
 
-    // Clean up event listener (CRITICAL)
     app.unlisten(stop_listener);
 
-    // Process and emit audio
-    if !audio_buffer.is_empty() {
-        // let duration = start_time.elapsed().as_secs_f32();
-
-        // Apply noise gate
-        let cleaned_audio = apply_noise_gate(&audio_buffer, config.noise_gate_threshold);
-        let cleaned_audio = normalize_audio_level(&cleaned_audio, 0.1);
-
-        match samples_to_wav_b64(sr, &cleaned_audio) {
-            Ok(b64) => {
-                let _ = app.emit("speech-detected", b64);
-            }
-            Err(e) => {
-                error!("Failed to encode continuous audio: {}", e);
-                let _ = app.emit("audio-encoding-error", e);
-            }
-        }
-    } else {
-        warn!("No audio captured in continuous mode");
-        let _ = app.emit("audio-encoding-error", "No audio recorded");
+    // Finish streaming STT
+    if stt_session.is_some() {
+        finish_streaming_stt(&app, &mut stt_session, &mut resampler, &provider).await;
     }
 
     let _ = app.emit("continuous-recording-stopped", ());
 }
 
-// Apply noise gate
-fn apply_noise_gate(samples: &[f32], threshold: f32) -> Vec<f32> {
-    const KNEE_RATIO: f32 = 3.0; // Compression ratio for soft knee
+// --- Audio processing utilities ---
 
+fn apply_noise_gate(samples: &[f32], threshold: f32) -> Vec<f32> {
+    const KNEE_RATIO: f32 = 3.0;
     samples
         .iter()
         .map(|&s| {
@@ -376,128 +496,106 @@ fn apply_noise_gate(samples: &[f32], threshold: f32) -> Vec<f32> {
         .collect()
 }
 
-// Calculate RMS and peak (optimized)
 fn calculate_audio_metrics(chunk: &[f32]) -> (f32, f32) {
     let mut sumsq = 0.0f32;
     let mut peak = 0.0f32;
-
     for &v in chunk {
         let a = v.abs();
         peak = peak.max(a);
         sumsq += v * v;
     }
-
     let rms = (sumsq / chunk.len() as f32).sqrt();
     (rms, peak)
 }
 
-fn normalize_audio_level(samples: &[f32], target_rms: f32) -> Vec<f32> {
-    if samples.is_empty() {
-        return Vec::new();
-    }
+// --- Tauri commands for STT config management ---
 
-    let sum_squares: f32 = samples.iter().map(|&s| s * s).sum();
-    let current_rms = (sum_squares / samples.len() as f32).sqrt();
-
-    if current_rms < 0.001 {
-        return samples.to_vec();
-    }
-
-    let gain = (target_rms / current_rms).min(10.0);
-
-    samples
-        .iter()
-        .map(|&s| {
-            let amplified = s * gain;
-            if amplified.abs() > 1.0 {
-                amplified.signum() * (1.0 - (-amplified.abs()).exp())
-            } else {
-                amplified
-            }
-        })
-        .collect()
+#[tauri::command]
+pub async fn get_streaming_stt_providers() -> Result<Vec<streaming_stt::StreamingSttProviderInfo>, String> {
+    Ok(streaming_stt::get_all_providers())
 }
 
-// Convert samples to WAV base64 (with proper error handling)
-fn samples_to_wav_b64(sample_rate: u32, mono_f32: &[f32]) -> Result<String, String> {
-    // Validate sample rate
-    if !(8000..=96000).contains(&sample_rate) {
-        error!("Invalid sample rate: {}", sample_rate);
-        return Err(format!(
-            "Invalid sample rate: {}. Expected 8000-96000 Hz",
-            sample_rate
-        ));
-    }
+#[tauri::command]
+pub async fn set_stt_provider_config(
+    app: AppHandle,
+    provider_id: String,
+    variables: HashMap<String, String>,
+) -> Result<(), String> {
+    let app_data_dir = app
+        .path()
+        .app_data_dir()
+        .map_err(|e| format!("Failed to get app data directory: {}", e))?;
+    std::fs::create_dir_all(&app_data_dir)
+        .map_err(|e| format!("Failed to create app data directory: {}", e))?;
 
-    // Validate buffer
-    if mono_f32.is_empty() {
-        return Err("Empty audio buffer".to_string());
-    }
-
-    let mut cursor = Cursor::new(Vec::new());
-    let spec = WavSpec {
-        channels: 1,
-        sample_rate,
-        bits_per_sample: 16,
-        sample_format: hound::SampleFormat::Int,
-    };
-
-    let mut writer = WavWriter::new(&mut cursor, spec).map_err(|e| {
-        error!("Failed to create WAV writer: {}", e);
-        e.to_string()
-    })?;
-
-    for &s in mono_f32 {
-        let clamped = s.clamp(-1.0, 1.0);
-        let sample_i16 = (clamped * i16::MAX as f32) as i16;
-        writer.write_sample(sample_i16).map_err(|e| e.to_string())?;
-    }
-
-    writer.finalize().map_err(|e| e.to_string())?;
-
-    Ok(B64.encode(cursor.into_inner()))
+    let file_path = app_data_dir.join(format!("stt_config_{}.json", provider_id));
+    let value = serde_json::to_string(&variables)
+        .map_err(|e| format!("Failed to serialize config: {}", e))?;
+    std::fs::write(&file_path, value)
+        .map_err(|e| format!("Failed to write STT config: {}", e))?;
+    Ok(())
 }
+
+#[tauri::command]
+pub async fn get_stt_provider_config(
+    app: AppHandle,
+    provider_id: String,
+) -> Result<HashMap<String, String>, String> {
+    let app_data_dir = app
+        .path()
+        .app_data_dir()
+        .map_err(|e| format!("Failed to get app data directory: {}", e))?;
+    let file_path = app_data_dir.join(format!("stt_config_{}.json", provider_id));
+
+    if !file_path.exists() {
+        return Ok(HashMap::new());
+    }
+
+    let content = std::fs::read_to_string(&file_path)
+        .map_err(|e| format!("Failed to read STT config: {}", e))?;
+    let variables: HashMap<String, String> = serde_json::from_str(&content)
+        .map_err(|e| format!("Failed to parse STT config: {}", e))?;
+    Ok(variables)
+}
+
+// --- Existing commands (unchanged) ---
 
 #[tauri::command]
 pub async fn stop_system_audio_capture(app: AppHandle) -> Result<(), String> {
     let state = app.state::<crate::AudioState>();
 
-    // Abort task in separate scope (Send trait fix)
+    // Abort existing task and clear the handle
     {
         let mut guard = state
             .stream_task
             .lock()
             .map_err(|e| format!("Failed to acquire task lock: {}", e))?;
-
         if let Some(task) = guard.take() {
             task.abort();
         }
+        // Explicitly ensure it's None (guard.take() already does this, but be safe)
+        *guard = None;
     }
 
-    // LONGER delay for proper cleanup (300ms instead of 150ms)
-    tokio::time::sleep(tokio::time::Duration::from_millis(300)).await;
+    // Wait for task to fully terminate
+    tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
 
-    // Mark as not capturing
+    // Clear capturing flag
     *state
         .is_capturing
         .lock()
         .map_err(|e| format!("Failed to update capturing state: {}", e))? = false;
 
-    // Additional cleanup delay (CRITICAL for mic indicator)
     tokio::time::sleep(tokio::time::Duration::from_millis(200)).await;
 
-    // Emit stopped event
     let _ = app.emit("capture-stopped", ());
     Ok(())
 }
 
-/// Manual stop for continuous recording
 #[tauri::command]
 pub async fn manual_stop_continuous(app: AppHandle) -> Result<(), String> {
     let _ = app.emit("manual-stop-continuous", ());
-
     tokio::time::sleep(tokio::time::Duration::from_millis(20)).await;
-
     Ok(())
 }
 
@@ -538,24 +636,15 @@ pub async fn request_system_audio_access(app: AppHandle) -> Result<(), String> {
     #[cfg(target_os = "linux")]
     {
         let commands = ["pavucontrol", "gnome-control-center sound"];
-        let mut opened = false;
-
         for cmd in &commands {
             if app.shell().command(cmd).spawn().is_ok() {
-                opened = true;
                 break;
             }
         }
-
-        if !opened {
-            warn!("Failed to open audio settings on Linux");
-        }
     }
-
     Ok(())
 }
 
-// VAD Configuration Management
 #[tauri::command]
 pub async fn get_vad_config(app: AppHandle) -> Result<VadConfig, String> {
     let state = app.state::<crate::AudioState>();
@@ -569,20 +658,17 @@ pub async fn get_vad_config(app: AppHandle) -> Result<VadConfig, String> {
 
 #[tauri::command]
 pub async fn update_vad_config(app: AppHandle, config: VadConfig) -> Result<(), String> {
-    // Validate config
     if config.sensitivity_rms < 0.0 || config.sensitivity_rms > 1.0 {
         return Err("Invalid sensitivity_rms: must be 0.0-1.0".to_string());
     }
     if config.max_recording_duration_secs > 3600 {
-        return Err("Invalid max_recording_duration_secs: must be <= 3600 (1 hour)".to_string());
+        return Err("Invalid max_recording_duration_secs: must be <= 3600".to_string());
     }
-
     let state = app.state::<crate::AudioState>();
     *state
         .vad_config
         .lock()
         .map_err(|e| format!("Failed to update VAD config: {}", e))? = config;
-
     Ok(())
 }
 
@@ -602,11 +688,8 @@ pub fn get_audio_sample_rate(_app: AppHandle) -> Result<u32, String> {
         error!("Failed to create speaker input: {}", e);
         format!("Failed to access system audio: {}", e)
     })?;
-
     let stream = input.stream();
-    let sr = stream.sample_rate();
-
-    Ok(sr)
+    Ok(stream.sample_rate())
 }
 
 #[tauri::command]

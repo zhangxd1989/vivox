@@ -1,21 +1,21 @@
 import { Header } from "@/components";
 import { UseSettingsReturn } from "@/types";
 import { Providers } from "./Providers";
-import { CustomProviders } from "./CustomProvider";
 
 export const STTProviders = (settings: UseSettingsReturn) => {
   return (
     <div id="stt-providers" className="space-y-3">
       <Header
-        title="STT提供商"
-        description="选择您偏好的STT服务提供商以开始使用。"
+        title="流式 STT 提供商"
+        description="配置实时语音识别服务提供商。音频通过 WebSocket 流式传输，说话时即可看到转录结果。"
         isMainTitle
       />
 
-      {/* Custom Provider */}
-      <CustomProviders {...settings} />
-      {/* Providers Selection */}
-      <Providers {...settings} />
+      {/* Streaming Provider Selection + Config */}
+      <Providers
+        selectedSttProvider={settings.selectedSttProvider}
+        onSetSelectedSttProvider={settings.onSetSelectedSttProvider}
+      />
     </div>
   );
 };

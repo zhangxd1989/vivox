@@ -1,3 +1,20 @@
+// Streaming STT providers (used by system audio capture via Rust WebSocket)
+// Each provider requires only configuration variables (API keys etc.)
+// The WebSocket protocol is handled entirely in the Rust backend
+export const STREAMING_STT_PROVIDERS = [
+  {
+    id: "dashscope",
+    name: "阿里云百炼 Fun-ASR",
+    variables: [
+      { key: "api_key", label: "DashScope API Key", is_secret: true },
+    ],
+  },
+  // Future providers can be added here:
+  // { id: "iflytek-ws", name: "讯飞实时识别", variables: [...] },
+  // { id: "deepgram", name: "Deepgram", variables: [...] },
+];
+
+// HTTP STT providers (used by microphone VAD via browser-side fetchSTT)
 export const SPEECH_TO_TEXT_PROVIDERS = [
   // ========== 国内 STT 服务 ==========
   {
@@ -63,14 +80,10 @@ export const SPEECH_TO_TEXT_PROVIDERS = [
   {
     id: "aliyun-stt",
     name: "阿里云语音识别",
-    curl: `curl -X POST "https://nls-gateway.aliyuncs.com/stream/v1/asr" \\
-      -H "Authorization: Bearer {{API_KEY}}" \\
-      -H "Content-Type: application/json" \\
-      -d '{
-        "format": "wav",
-        "sample_rate": 16000,
-        "audio": "{{AUDIO}}"
-      }'`,
+    curl: `curl -X POST "https://nls-gateway-cn-shanghai.aliyuncs.com/stream/v1/asr?appkey={{APP_KEY}}&format=pcm&sample_rate=16000&enable_punctuation_prediction=true&enable_inverse_text_normalization=true" \\
+      -H "X-NLS-Token: {{API_KEY}}" \\
+      -H "Content-Type: application/octet-stream" \\
+      --data-binary "{{AUDIO}}"`,
     responseContentPath: "result",
     streaming: false,
   },

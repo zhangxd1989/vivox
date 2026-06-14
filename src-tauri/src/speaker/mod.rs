@@ -19,6 +19,9 @@ mod linux;
 use linux::{SpeakerInput as PlatformSpeakerInput, SpeakerStream as PlatformSpeakerStream};
 
 mod commands;
+pub mod streaming_stt;
+mod resampler;
+mod dashscope;
 
 // Re-export commands for tauri handler
 pub use commands::*;

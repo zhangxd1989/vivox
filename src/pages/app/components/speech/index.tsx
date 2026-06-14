@@ -34,6 +34,11 @@ export const SystemAudio = (props: useSystemAudioType) => {
     isAIProcessing,
     lastTranscription,
     lastAIResponse,
+    partialTranscription,
+    isWsConnected,
+    sentenceResults,
+    segmentSummary,
+    isSegmentSummarizing,
     error,
     setupRequired,
     startCapture,
@@ -347,6 +352,26 @@ export const SystemAudio = (props: useSystemAudioType) => {
                       onIgnore={ignoreContinuousRecording}
                     />
 
+                    {/* Partial Transcription (real-time streaming results) */}
+                    {(partialTranscription || isWsConnected) && (
+                      <div className="p-2.5 rounded-lg bg-blue-50/50 border border-blue-200/50">
+                        <div className="flex items-center gap-1.5 mb-1">
+                          <div className={cn(
+                            "w-1.5 h-1.5 rounded-full animate-pulse",
+                            isWsConnected ? "bg-blue-500" : "bg-gray-400"
+                          )} />
+                          <span className="text-[9px] font-medium text-blue-600 uppercase tracking-wide">
+                            {isWsConnected ? "实时转录中" : "等待连接"}
+                          </span>
+                        </div>
+                        {partialTranscription && (
+                          <p className="text-[11px] text-blue-900/80 italic leading-relaxed">
+                            {partialTranscription}
+                          </p>
+                        )}
+                      </div>
+                    )}
+
                     {/* AI Response */}
                     <ResultsSection
                       lastTranscription={lastTranscription}
@@ -355,6 +380,9 @@ export const SystemAudio = (props: useSystemAudioType) => {
                       conversation={conversation}
                       conversationMode={conversationMode}
                       setConversationMode={setConversationMode}
+                      sentenceResults={sentenceResults}
+                      segmentSummary={segmentSummary}
+                      isSegmentSummarizing={isSegmentSummarizing}
                     />
 
                     {/* Settings Panel */}
